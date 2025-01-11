@@ -1,5 +1,5 @@
 /**
- * @file src/platform/macos/input.cpp
+ * @file src/platform/macos/input.mm
  * @brief Definitions for macOS input handling.
  */
 #include "src/input.h"
@@ -14,6 +14,7 @@
 #include "src/utility.h"
 
 #include <ApplicationServices/ApplicationServices.h>
+#include <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <iostream>
 #include <thread>
@@ -227,9 +228,57 @@ const KeyCodeMap kKeyCodesMap[] = {
 };
   // clang-format on
 
+std::string
+getKeyboardLayout() {
+    TISInputSourceRef currentKeyboard = TISCopyCurrentKeyboardInputSource();
+
+    if (!currentKeyboard) {
+      return "Unknown";
+    }
+
+    CFStringRef sourceID = static_cast<CFStringRef>(
+        TISGetInputSourceProperty(currentKeyboard, kTISPropertyInputSourceID));
+
+    if (!sourceID) {
+      CFRelease(currentKeyboard);
+      return "Unknown";
+    }
+
+    char buffer[256];
+    std::string layout;
+    if (CFStringGetCString(sourceID, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+      layout = buffer;
+    } else {
+      layout = "Unknown";
+    }
+
+    CFRelease(currentKeyboard);
+    return layout;
+  }
+
+  int
+  convertKeyCodeFromLayoutKeyboard(int keycode) {
+    std::string layout = getKeyboardLayout();
+
+    if (layout.find("ABC-AZERTY") != std::string::npos) {
+      switch (keycode) {
+      case 0xc0:
+        return kVK_ISO_Section;
+      case 0xe2:
+        return kVK_ANSI_Grave;
+      }
+    }
+    return -1;
+  }
+
   int
   keysym(int keycode) {
+    int keyCodeFromLayout = convertKeyCodeFromLayoutKeyboard(keycode);
     KeyCodeMap key_map {};
+
+    if (keyCodeFromLayout != -1) {
+      return keyCodeFromLayout;
+    }
 
     key_map.win_keycode = keycode;
     const KeyCodeMap *temp_map = std::lower_bound(
@@ -243,6 +292,42 @@ const KeyCodeMap kKeyCodesMap[] = {
     return temp_map->mac_keycode;
   }
 
+
+  void
+  simulate_control_arrow(CGKeyCode arrowKey, bool release) {
+    CGEventRef controlDown = CGEventCreateKeyboardEvent(nullptr, kVK_Control, true);
+    CGEventRef controlUp = CGEventCreateKeyboardEvent(nullptr, kVK_Control, false);
+
+    CGEventRef arrowDown = CGEventCreateKeyboardEvent(nullptr, arrowKey, true);
+    CGEventRef arrowUp = CGEventCreateKeyboardEvent(nullptr, arrowKey, false);
+
+    if (!release) {
+        CGEventPost(kCGHIDEventTap, controlDown);
+        CGEventPost(kCGHIDEventTap, arrowDown);
+    } else {
+        CGEventPost(kCGHIDEventTap, arrowUp);
+        CGEventPost(kCGHIDEventTap, controlUp);
+    }
+
+    CFRelease(controlDown);
+    CFRelease(controlUp);
+    CFRelease(arrowDown);
+    CFRelease(arrowUp);
+}
+
+  bool
+  process_control_arrow(uint16_t key, bool release) {
+    static bool controlPressed = false;
+    static bool arrowPressed = false;
+
+    if (key == kVK_Control || key == kVK_RightControl) {
+        controlPressed = !release;
+    } else if (key == kVK_LeftArrow || key == kVK_RightArrow || key == kVK_UpArrow || key == kVK_DownArrow) {
+        arrowPressed = !release;
+    }
+    return controlPressed && arrowPressed;
+}
+
   void
   keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
     auto key = keysym(modcode);
@@ -253,8 +338,14 @@ const KeyCodeMap kKeyCodesMap[] = {
       return;
     }
 
+    if (process_control_arrow(key, release)) {
+        BOOST_LOG(debug) << "Detected Control + Arrow combination.";
+        simulate_control_arrow((CGKeyCode)key, release);
+        return;
+    }
+
     auto macos_input = ((macos_input_t *) input.get());
-    auto event = macos_input->kb_event;
+    //auto event = macos_input->kb_event;
 
     if (key == kVK_Shift || key == kVK_RightShift ||
         key == kVK_Command || key == kVK_RightCommand ||
@@ -282,15 +373,17 @@ const KeyCodeMap kKeyCodesMap[] = {
       }
 
       macos_input->kb_flags = release ? macos_input->kb_flags & ~mask : macos_input->kb_flags | mask;
-      CGEventSetType(event, kCGEventFlagsChanged);
-      CGEventSetFlags(event, macos_input->kb_flags);
+      // Create a new event for modifier key
+      CGEventRef modifierEvent = CGEventCreateKeyboardEvent(nullptr, (CGKeyCode)key, !release);
+      CGEventSetFlags(modifierEvent, macos_input->kb_flags);
+      CGEventPost(kCGHIDEventTap, modifierEvent);
+      CFRelease(modifierEvent);
+    } else {
+      CGEventRef regularEvent = CGEventCreateKeyboardEvent(nullptr, (CGKeyCode)key, !release);
+      CGEventSetFlags(regularEvent, macos_input->kb_flags); // Apply current modifier flags
+      CGEventPost(kCGHIDEventTap, regularEvent);
+      CFRelease(regularEvent);
     }
-    else {
-      CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, key);
-      CGEventSetType(event, release ? kCGEventKeyUp : kCGEventKeyDown);
-    }
-
-    CGEventPost(kCGHIDEventTap, event);
   }
 
   void
